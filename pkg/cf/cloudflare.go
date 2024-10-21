@@ -144,25 +144,27 @@ func (cfState *CloudflareState) UpdateExpr() bool {
 }
 
 type CloudflareWorker struct {
-	Logger                  *log.Entry
-	APILogger               *log.Logger
-	Account                 cfg.AccountConfig
-	ZoneLocks               []ZoneLock
-	Zones                   []cloudflare.Zone
-	FirewallRulesByZoneID   map[string]*[]cloudflare.FirewallRule
-	CFStateByAction         map[string]*CloudflareState
-	Ctx                     context.Context
-	LAPIStream              chan *models.DecisionsStreamResponse
-	UpdateFrequency         time.Duration
-	NewIPDecisions          []*models.Decision
-	ExpiredIPDecisions      []*models.Decision
-	NewASDecisions          []*models.Decision
-	ExpiredASDecisions      []*models.Decision
-	NewCountryDecisions     []*models.Decision
-	ExpiredCountryDecisions []*models.Decision
-	API                     cloudflareAPI
-	Count                   prometheus.Counter
-	TokenCallCount          *uint32
+	Logger                   *log.Entry
+	APILogger                *log.Logger
+	Account                  cfg.AccountConfig
+	ZoneLocks                []ZoneLock
+	Zones                    []cloudflare.Zone
+	FirewallRulesByZoneID    map[string]*[]cloudflare.FirewallRule
+	CFStateByAction          map[string]*CloudflareState
+	Ctx                      context.Context
+	LAPIStream               chan *models.DecisionsStreamResponse
+	UpdateFrequency          time.Duration
+	NewIPDecisions           []*models.Decision
+	ExpiredIPDecisions       []*models.Decision
+	NewASDecisions           []*models.Decision
+	ExpiredASDecisions       []*models.Decision
+	NewHostnameDecisions     []*models.Decision
+	ExpiredHostnameDecisions []*models.Decision
+	NewCountryDecisions      []*models.Decision
+	ExpiredCountryDecisions  []*models.Decision
+	API                      cloudflareAPI
+	Count                    prometheus.Counter
+	TokenCallCount           *uint32
 }
 
 // this is useful for testing allowing us to mock it.
@@ -768,17 +770,19 @@ func (worker *CloudflareWorker) getContainerByDecisionScope(scope string, decisi
 	var containerByDecisionScope map[string]*([]*models.Decision)
 	if decisionIsExpired {
 		containerByDecisionScope = map[string]*([]*models.Decision){
-			"IP":      &worker.ExpiredIPDecisions,
-			"RANGE":   &worker.ExpiredIPDecisions, // Cloudflare IP lists handle ranges fine
-			"COUNTRY": &worker.ExpiredCountryDecisions,
-			"AS":      &worker.ExpiredASDecisions,
+			"IP":       &worker.ExpiredIPDecisions,
+			"RANGE":    &worker.ExpiredIPDecisions, // Cloudflare IP lists handle ranges fine
+			"COUNTRY":  &worker.ExpiredCountryDecisions,
+			"AS":       &worker.ExpiredASDecisions,
+			"HOSTNAME": &worker.ExpiredHostnameDecisions,
 		}
 	} else {
 		containerByDecisionScope = map[string]*([]*models.Decision){
-			"IP":      &worker.NewIPDecisions,
-			"RANGE":   &worker.NewIPDecisions, // Cloudflare IP lists handle ranges fine
-			"COUNTRY": &worker.NewCountryDecisions,
-			"AS":      &worker.NewASDecisions,
+			"IP":       &worker.NewIPDecisions,
+			"RANGE":    &worker.NewIPDecisions, // Cloudflare IP lists handle ranges fine
+			"COUNTRY":  &worker.NewCountryDecisions,
+			"AS":       &worker.NewASDecisions,
+			"HOSTNAME": &worker.NewHostnameDecisions,
 		}
 	}
 	scope = strings.ToUpper(scope)
@@ -809,6 +813,89 @@ func (worker *CloudflareWorker) CollectLAPIStream(streamDecision *models.Decisio
 	for _, decision := range streamDecision.Deleted {
 		worker.insertDecision(decision, true)
 	}
+}
+
+// UpdateHostnameChallenges creates managed challenge rules for new hostname decisions.
+// NOTE: Currently only managed challenge is supported on hostname scopes.
+func (worker *CloudflareWorker) UpdateHostnameChallenges() error {
+	// Loop through the decisions related to hostname
+	for _, decision := range worker.NewHostnameDecisions {
+		hostname := *decision.Value
+
+		// Get the appropriate zone
+		zoneID := ""
+		for _, zoneCfg := range worker.Account.ZoneConfigs {
+			for _, action := range zoneCfg.Actions {
+				if action == "managed_challenge" {
+					zoneID = zoneCfg.ID
+					break
+				}
+			}
+			if zoneID != "" {
+				break
+			}
+		}
+
+		// Ensure we found a zone
+		if zoneID == "" {
+			worker.Logger.Errorf("No zone found for managed_challenge")
+			return fmt.Errorf("no zone found for managed_challenge")
+		}
+
+		// Retrieve the existing firewall rules for the zone
+		rules, err := worker.getAPI().FirewallRules(worker.Ctx, zoneID, cloudflare.PaginationOptions{})
+		if err != nil {
+			worker.Logger.Errorf("Failed to retrieve firewall rules for zone %s: %v", zoneID, err)
+			return err
+		}
+
+		// Create the filter expression for the hostname
+		filterExpression := fmt.Sprintf(`http.host eq "%s"`, hostname)
+
+		// Check if a managed challenge rule already exists for the hostname
+		existingRule := false
+		for _, rule := range rules {
+			if rule.Filter.Expression == filterExpression && rule.Action == "managed_challenge" {
+				worker.Logger.Infof("Managed challenge already exists for hostname %s", hostname)
+				existingRule = true
+				break
+			}
+		}
+
+		// If no existing rule, create a new firewall rule with managed challenge
+		if !existingRule {
+			filter := cloudflare.Filter{
+				Expression: filterExpression,
+			}
+			rule := cloudflare.FirewallRule{
+				Filter:      filter,
+				Action:      "managed_challenge",
+				Description: fmt.Sprintf("Managed challenge for hostname %s", hostname),
+			}
+
+			worker.Logger.
+				WithFields(log.Fields{
+					"zone_id":  zoneID,
+					"hostname": hostname,
+					"filter":   filterExpression,
+					"action":   "managed_challenge",
+					"rule":     rule,
+				}).
+				Infof("Creating managed challenge rule for hostname")
+
+			// _, err := worker.getAPI().CreateFirewallRules(worker.Ctx, zoneID, []cloudflare.FirewallRule{rule})
+			// if err != nil {
+			// 	worker.Logger.Errorf("Failed to create managed challenge rule for hostname %s: %v", hostname, err)
+			// 	return err
+			// }
+
+			worker.Logger.Infof("Created managed challenge rule for hostname %s", hostname)
+		}
+	}
+
+	worker.NewHostnameDecisions = make([]*models.Decision, 0)
+
+	return nil
 }
 
 func (worker *CloudflareWorker) SendASBans() error {
@@ -994,6 +1081,7 @@ func (worker *CloudflareWorker) Run() error {
 			worker.runProcessorOnDecisions(worker.SendCountryBans, worker.NewCountryDecisions)
 			worker.runProcessorOnDecisions(worker.DeleteASBans, worker.ExpiredASDecisions)
 			worker.runProcessorOnDecisions(worker.SendASBans, worker.NewASDecisions)
+			worker.runProcessorOnDecisions(worker.UpdateHostnameChallenges, worker.NewHostnameDecisions)
 
 			err = worker.UpdateRules()
 			if err != nil {
